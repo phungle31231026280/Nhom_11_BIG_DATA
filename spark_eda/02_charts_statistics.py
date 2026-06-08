@@ -1,15 +1,30 @@
 """
-EDA: Phân tích Sản phẩm & Kênh Marketing
-Dataset: TheLook E-commerce (loaded from HDFS)
+EDA: TheLook E-commerce (loaded from HDFS)
+File 02: Charts & Statistics — Vẽ biểu đồ và thống kê
 
-Section 5: Product Analysis
+Phần 1: Tổng quan kinh doanh (Đồ hoạ đơn biến)
+    1.1  Monthly revenue trend
+    1.2  Monthly orders & AOV trend
+    1.3  Order status distribution
+    1.4  Sale price distribution
+    1.5  User age distribution
+
+Phần 2: Phân tích khách hàng (Đồ hoạ đơn + đa biến)
+    2.1  Gender × Revenue
+    2.2  Age Group × Purchase Frequency
+    2.3  Traffic Source → Conversion Rate
+    2.4  Top Countries by Revenue
+    2.5  Top Countries by Return Rate
+
+
+Phần 5: Phân tích sản phẩm (Đồ hoạ đơn + đa biến)
     5.1  Revenue vs Quantity by Category
     5.2  Profit Margin by Category
     5.3  Return Rate by Category
     5.4  Return Rate × Profit Margin (Double-Risk Scatter)
     5.5  Category × Gender
 
-Section 6: Channel & Behavior Analysis
+Phần 6: Phân tích kênh & hành vi (Đồ hoạ đa biến)
     6.1  Traffic Source × AOV
     6.2  Traffic Source × Return Rate
     6.3  Delivery Time by Country & Distribution
@@ -21,10 +36,12 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import seaborn as sns
-
+import os
+from dotenv import load_dotenv
+load_dotenv()
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
-from pyspark.sql.functions import col, unix_timestamp, when
+from pyspark.sql.functions import col, unix_timestamp, when, date_format
 
 sns.set_theme(style="whitegrid", palette="muted")
 plt.rcParams.update({
@@ -35,11 +52,9 @@ plt.rcParams.update({
 })
 
 SUPTITLE_KW = dict(fontsize=14, fontweight="bold")
+DIVIDER     = "=" * 60
+SEP         = lambda title: print(f"\n{'-'*40}\n  {title}\n{'-'*40}")
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Helper: save figure with suptitle always visible
-# ─────────────────────────────────────────────────────────────────────────────
 def save_fig(path, suptitle=None):
     if suptitle:
         plt.suptitle(suptitle, **SUPTITLE_KW)
@@ -47,30 +62,25 @@ def save_fig(path, suptitle=None):
     plt.savefig(path, bbox_inches="tight", dpi=150)
     plt.show()
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  1. Spark session
-# ─────────────────────────────────────────────────────────────────────────────
 spark = (
     SparkSession.builder
-    .appName("TheLook_ECommerce_Analysis")
+    .appName("TheLook_EDA_Full")
     .config("spark.sql.legacy.timeParserPolicy", "LEGACY")
     .config("spark.sql.shuffle.partitions", "8")
     .getOrCreate()
 )
 spark.sparkContext.setLogLevel("WARN")
 
-HDFS_BASE = "hdfs://localhost:9000/Doan/datatest"
-
+HDFS_BASE = os.getenv('HDFS_BASE_DIR')
 def load(name):
     path = f"{HDFS_BASE}/thelook_ecommerce.{name}.csv"
     print(f"  Loading {name} ...")
     return (
         spark.read
-        .option("header", "true")
+        .option("header",      "true")
         .option("inferSchema", "true")
-        .option("multiLine", "true")
-        .option("escape", '"')
+        .option("multiLine",   "true")
+        .option("escape",      '"')
         .csv(path)
     )
 
@@ -79,11 +89,13 @@ orders_sp      = load("orders")
 order_items_sp = load("order_items")
 users_sp       = load("users")
 products_sp    = load("products")
+inventory_sp   = load("inventory_items")
+events_sp      = load("events")
 print("Done.\n")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  2. Parse timestamps & derive columns
+#  Parse timestamps & derive master DataFrame
 # ─────────────────────────────────────────────────────────────────────────────
 def safe_ts(c):
     return (
@@ -99,16 +111,52 @@ order_items_sp = (
     .withColumn("shipped_at",    safe_ts("shipped_at"))
     .withColumn("delivered_at",  safe_ts("delivered_at"))
     .withColumn("returned_at",   safe_ts("returned_at"))
+    .withColumn("created_at_ts", safe_ts("created_at"))
     .withColumn("delivery_days",
         (unix_timestamp("delivered_at") - unix_timestamp("shipped_at")) / 86400
     )
 )
+orders_sp = orders_sp.withColumn("created_at_ts", safe_ts("created_at"))
 
+inventory_sp = (
+    inventory_sp
+    .withColumn("created_at_ts", safe_ts("created_at"))
+    .withColumn("sold_at_ts",    safe_ts("sold_at"))
+    .withColumn("days_to_sell",
+        (unix_timestamp("sold_at_ts") - unix_timestamp("created_at_ts")) / 86400
+    )
+)
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  3. Build master DataFrame
-# ─────────────────────────────────────────────────────────────────────────────
+events_sp = events_sp.withColumn("created_at_ts", safe_ts("created_at"))
+
 full_sp = (
+    order_items_sp
+    .join(
+        users_sp.select(
+            col("id").alias("user_id_u"),
+            "gender", "age", "country", "traffic_source",
+        ),
+        order_items_sp["user_id"] == col("user_id_u"),
+        how="left",
+    )
+    .withColumn("is_returned", when(col("status") == "Returned", 1).otherwise(0))
+    .withColumn("is_complete",  when(col("status") == "Complete",  1).otherwise(0))
+)
+
+AGE_BINS   = [0, 18, 25, 35, 45, 55, 65, 200]
+AGE_LABELS = ["<18", "18–24", "25–34", "35–44", "45–54", "55–64", "65+"]
+
+def age_group_col(c="age"):
+    expr = when(col(c) < AGE_BINS[1], AGE_LABELS[0])
+    for i in range(1, len(AGE_LABELS)):
+        expr = expr.when((col(c) >= AGE_BINS[i]) & (col(c) < AGE_BINS[i + 1]), AGE_LABELS[i])
+    return expr.otherwise("Unknown")
+
+full_sp      = full_sp.withColumn("age_group", age_group_col())
+completed_sp = full_sp.filter(col("is_complete") == 1)
+
+# full_sp for phần 5 (with products join)
+full_sp_prod = (
     order_items_sp
     .join(
         products_sp.select(col("id").alias("prod_id"), "category", "cost", "department"),
@@ -129,17 +177,501 @@ full_sp = (
         ).otherwise(None)
     )
 )
+completed_sp_prod = full_sp_prod.filter(col("is_complete") == 1)
 
-completed_sp = full_sp.filter(col("is_complete") == 1)
+# inventory join for phần 3
+inv_full_sp = (
+    inventory_sp
+    .join(
+        products_sp.select(col("id").alias("prod_id"), "category", "name"),
+        inventory_sp["product_id"] == col("prod_id"),
+        how="left",
+    )
+    .withColumn("is_sold", when(col("sold_at_ts").isNotNull(), 1).otherwise(0))
+)
 
-print(f"Master DataFrame ready. Columns: {full_sp.columns}\n")
+print(f"Master DataFrames ready.\n")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  SECTION 5 — PRODUCT ANALYSIS
+#  PHẦN 1 — TỔNG QUAN KINH DOANH (Đồ hoạ đơn biến)
+# ═════════════════════════════════════════════════════════════════════════════
+print(f"\n{DIVIDER}")
+print("PHẦN 1: TỔNG QUAN KINH DOANH")
+print(DIVIDER)
+
+
+# ── 1.1  Monthly revenue trend ───────────────────────────────────────────────
+print("\n[1.1] Monthly Revenue Trend")
+
+monthly_rev = (
+    completed_sp
+    .withColumn("month", date_format("created_at_ts", "yyyy-MM"))
+    .groupBy("month")
+    .agg(F.sum("sale_price").alias("revenue"))
+    .orderBy("month")
+    .toPandas()
+)
+
+fig, ax = plt.subplots(figsize=(16, 6))
+ax.fill_between(monthly_rev["month"], monthly_rev["revenue"], alpha=0.25, color="#2980b9")
+ax.plot(monthly_rev["month"], monthly_rev["revenue"],
+        color="#2980b9", linewidth=2.5, marker="o", markersize=5)
+ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"${x/1e3:,.0f}K"))
+ax.set_xlabel("Month")
+ax.set_ylabel("Revenue ($)")
+n = max(1, len(monthly_rev) // 10)
+ax.set_xticks(range(0, len(monthly_rev), n))
+ax.set_xticklabels(monthly_rev["month"].iloc[::n], rotation=45, ha="right", fontsize=9)
+peak = monthly_rev.loc[monthly_rev["revenue"].idxmax()]
+ax.annotate(
+    f"Peak\n${peak['revenue']/1e3:,.0f}K",
+    xy=(peak["month"], peak["revenue"]),
+    xytext=(10, 15), textcoords="offset points",
+    fontsize=9, color="#c0392b",
+    arrowprops=dict(arrowstyle="->", color="#c0392b"),
+)
+save_fig("1_1_monthly_revenue.png", "Monthly Revenue Trend (Completed Orders)")
+
+print(f"  Total revenue   : ${monthly_rev['revenue'].sum():,.0f}")
+print(f"  Peak month      : {peak['month']}  —  ${peak['revenue']:,.0f}")
+print(f"  MoM avg growth  : {monthly_rev['revenue'].pct_change().mean()*100:.1f}%")
+
+
+# ── 1.2  Monthly orders & AOV ────────────────────────────────────────────────
+print("\n[1.2] Monthly Orders & AOV Trend")
+
+monthly_orders = (
+    completed_sp
+    .withColumn("month", date_format("created_at_ts", "yyyy-MM"))
+    .groupBy("month")
+    .agg(
+        F.countDistinct("order_id").alias("orders"),
+        F.sum("sale_price").alias("revenue"),
+    )
+    .orderBy("month")
+    .toPandas()
+)
+monthly_orders["AOV"] = monthly_orders["revenue"] / monthly_orders["orders"]
+
+fig, axes = plt.subplots(2, 1, figsize=(16, 10), sharex=True)
+
+axes[0].bar(monthly_orders["month"], monthly_orders["orders"],
+            color="#3498db", alpha=0.8)
+axes[0].set_title("Monthly Order Count")
+axes[0].set_ylabel("Orders")
+axes[0].yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"{x:,.0f}"))
+
+axes[1].plot(monthly_orders["month"], monthly_orders["AOV"],
+             color="#e67e22", linewidth=2.5, marker="o", markersize=5)
+axes[1].fill_between(monthly_orders["month"], monthly_orders["AOV"], alpha=0.2, color="#e67e22")
+axes[1].set_title("Average Order Value (AOV)")
+axes[1].set_ylabel("AOV ($)")
+axes[1].yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"${x:,.0f}"))
+n = max(1, len(monthly_orders) // 10)
+axes[1].set_xticks(range(0, len(monthly_orders), n))
+axes[1].set_xticklabels(monthly_orders["month"].iloc[::n], rotation=45, ha="right", fontsize=9)
+
+save_fig("1_2_monthly_orders_aov.png", "Monthly Orders & AOV Trend")
+
+print(f"  Avg monthly orders : {monthly_orders['orders'].mean():,.0f}")
+print(f"  Overall AOV        : ${monthly_orders['AOV'].mean():,.2f}")
+
+
+# ── 1.3  Order status distribution ───────────────────────────────────────────
+print("\n[1.3] Order Status Distribution")
+
+status_dist = (
+    order_items_sp
+    .groupBy("status").agg(F.count("*").alias("count"))
+    .orderBy(col("count").desc())
+    .toPandas()
+)
+total_items = status_dist["count"].sum()
+status_dist["pct"] = (status_dist["count"] / total_items * 100).round(2)
+
+STATUS_COLORS = {
+    "Complete":   "#2ecc71",
+    "Shipped":    "#3498db",
+    "Processing": "#f39c12",
+    "Cancelled":  "#e74c3c",
+    "Returned":   "#9b59b6",
+}
+colors_s = [STATUS_COLORS.get(s, "#95a5a6") for s in status_dist["status"]]
+
+fig, axes = plt.subplots(1, 2, figsize=(18, 7))
+bars = axes[0].bar(status_dist["status"], status_dist["count"], color=colors_s, width=0.6)
+axes[0].set_title("Order Item Count by Status")
+axes[0].set_ylabel("Count")
+axes[0].yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"{x:,.0f}"))
+for bar, pct in zip(bars, status_dist["pct"]):
+    axes[0].text(bar.get_x() + bar.get_width() / 2, bar.get_height() * 1.01,
+                 f"{pct:.1f}%", ha="center", va="bottom", fontsize=10)
+
+wedges, texts, autotexts = axes[1].pie(
+    status_dist["pct"],
+    labels=status_dist["status"],
+    colors=colors_s,
+    autopct="%1.1f%%",
+    startangle=140,
+    pctdistance=0.82,
+)
+for at in autotexts:
+    at.set_fontsize(9)
+axes[1].set_title("Order Status Share (%)")
+
+save_fig("1_3_order_status.png", "Order Status Distribution")
+print(status_dist.to_string(index=False))
+
+
+# ── 1.4  Sale price distribution ─────────────────────────────────────────────
+print("\n[1.4] Sale Price Distribution")
+
+price_stats_row = order_items_sp.agg(
+    F.min("sale_price").alias("min"),
+    F.max("sale_price").alias("max"),
+    F.mean("sale_price").alias("mean"),
+    F.percentile_approx("sale_price", [0.5, 0.75, 0.9, 0.95, 0.99]).alias("pctiles"),
+).toPandas().iloc[0]
+price_stats = {
+    "min":  price_stats_row["min"],
+    "max":  price_stats_row["max"],
+    "mean": price_stats_row["mean"],
+}
+p50, p75, p90, p95, p99 = price_stats_row["pctiles"]
+
+price_sample = (
+    order_items_sp.select("sale_price").filter(col("sale_price").isNotNull())
+    .sample(fraction=min(1.0, 100000 / order_items_sp.count()))
+    .toPandas()
+)
+
+fig, axes = plt.subplots(1, 2, figsize=(18, 7))
+
+sns.histplot(price_sample["sale_price"], bins=80, kde=True, ax=axes[0], color="#3498db")
+axes[0].axvline(price_stats["mean"], color="red",    linestyle="--", linewidth=1.5,
+                label=f"Mean: ${price_stats['mean']:.0f}")
+axes[0].axvline(p50,                 color="green",  linestyle="--", linewidth=1.5,
+                label=f"Median: ${p50:.0f}")
+axes[0].axvline(p95,                 color="orange", linestyle=":",  linewidth=1.5,
+                label=f"p95: ${p95:.0f}")
+axes[0].set_title("Full Distribution (log-scale x)")
+axes[0].set_xlabel("Sale Price ($)")
+axes[0].set_xscale("log")
+axes[0].legend()
+
+sns.histplot(price_sample[price_sample["sale_price"] <= p99]["sale_price"],
+             bins=60, kde=True, ax=axes[1], color="#9b59b6")
+axes[1].axvline(price_stats["mean"], color="red",   linestyle="--", linewidth=1.5,
+                label=f"Mean: ${price_stats['mean']:.0f}")
+axes[1].axvline(p50,                 color="green", linestyle="--", linewidth=1.5,
+                label=f"Median: ${p50:.0f}")
+axes[1].set_title(f"Capped at p99 (${p99:.0f})")
+axes[1].set_xlabel("Sale Price ($)")
+axes[1].legend()
+save_fig("1_4_sale_price_dist.png",
+         "Sale Price Distribution: Long Tail & High-Value Outliers")
+
+for label, val in [("min", price_stats["min"]), ("mean", price_stats["mean"]),
+                   ("p50", p50), ("p75", p75), ("p90", p90),
+                   ("p95", p95), ("p99", p99), ("max", price_stats["max"])]:
+    print(f"  {label:>4} : ${val:.2f}")
+
+
+# ── 1.5  User age distribution ───────────────────────────────────────────────
+print("\n[1.5] User Age Distribution")
+
+users_age = users_sp.select("age").filter(col("age").isNotNull()).toPandas()
+users_age["age_group"] = pd.cut(
+    users_age["age"],
+    bins=[0, 18, 25, 35, 45, 55, 65, 120],
+    labels=AGE_LABELS[:-1] + ["65+"],
+    right=False,
+)
+group_counts = (
+    users_age.groupby("age_group", observed=True)["age"]
+    .count().reset_index(name="count")
+)
+group_counts["pct"] = group_counts["count"] / group_counts["count"].sum() * 100
+
+fig, axes = plt.subplots(1, 2, figsize=(18, 7))
+colors_age = sns.color_palette("Blues", len(group_counts))[::-1]
+bars = axes[0].bar(group_counts["age_group"].astype(str), group_counts["count"], color=colors_age)
+axes[0].set_title("User Count by Age Group")
+axes[0].set_xlabel("Age Group")
+axes[0].set_ylabel("Number of Users")
+for bar, pct in zip(bars, group_counts["pct"]):
+    axes[0].text(bar.get_x() + bar.get_width() / 2,
+                 bar.get_height() + users_age.shape[0] * 0.003,
+                 f"{pct:.1f}%", ha="center", va="bottom", fontsize=9)
+sns.histplot(users_age["age"], bins=50, kde=True, ax=axes[1], color="#1abc9c")
+axes[1].axvline(users_age["age"].mean(),   color="red",  linestyle="--", linewidth=1.5,
+                label=f"Mean: {users_age['age'].mean():.1f}")
+axes[1].axvline(users_age["age"].median(), color="blue", linestyle="--", linewidth=1.5,
+                label=f"Median: {users_age['age'].median():.1f}")
+axes[1].set_title("Age Distribution (Continuous)")
+axes[1].set_xlabel("Age")
+axes[1].legend()
+save_fig("1_5_user_age_dist.png", "User Age Distribution: Who Are Our Customers?")
+
+print(group_counts.to_string(index=False))
+print(f"  Mean: {users_age['age'].mean():.1f}  |  Median: {users_age['age'].median():.1f}"
+      f"  |  Std: {users_age['age'].std():.1f}")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  PHẦN 2 — PHÂN TÍCH KHÁCH HÀNG (Đồ hoạ đơn + đa biến)
+# ═════════════════════════════════════════════════════════════════════════════
+print(f"\n{DIVIDER}")
+print("PHẦN 2: PHÂN TÍCH KHÁCH HÀNG")
+print(DIVIDER)
+
+
+# ── 2.1  Gender × Revenue ────────────────────────────────────────────────────
+print("\n[2.1] Gender × Revenue")
+
+gender_rev = (
+    completed_sp
+    .filter(col("gender").isin("M", "F"))
+    .groupBy("gender")
+    .agg(
+        F.sum("sale_price").alias("total_revenue"),
+        F.countDistinct("user_id").alias("unique_buyers"),
+        F.countDistinct("order_id").alias("total_orders"),
+        F.mean("sale_price").alias("avg_item_price"),
+    )
+    .toPandas()
+    .set_index("gender")
+)
+gender_rev["revenue_per_buyer"] = gender_rev["total_revenue"] / gender_rev["unique_buyers"]
+gender_rev["orders_per_buyer"]  = gender_rev["total_orders"]  / gender_rev["unique_buyers"]
+
+GENDER_COLORS = {"M": "#3498db", "F": "#e91e8c"}
+colors_g = [GENDER_COLORS.get(g, "#95a5a6") for g in gender_rev.index]
+
+fig, axes = plt.subplots(1, 3, figsize=(20, 7))
+for ax, (metric, title, fmt) in zip(axes, [
+    ("total_revenue",    "Total Revenue ($)",     lambda x: f"${x/1e6:.1f}M"),
+    ("revenue_per_buyer","Revenue per Buyer ($)", lambda x: f"${x:,.0f}"),
+    ("orders_per_buyer", "Orders per Buyer",      lambda x: f"{x:.2f}"),
+]):
+    bars = ax.bar(gender_rev.index, gender_rev[metric], color=colors_g, width=0.5)
+    ax.set_title(title)
+    ax.set_xlabel("Gender")
+    for bar, val in zip(bars, gender_rev[metric]):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() * 1.01,
+                fmt(val), ha="center", va="bottom", fontsize=10, fontweight="bold")
+save_fig("2_1_gender_revenue.png", "Gender × Revenue: Who Spends More?")
+
+print(gender_rev[["total_revenue", "unique_buyers", "revenue_per_buyer",
+                   "orders_per_buyer", "avg_item_price"]].round(2).to_string())
+
+
+# ── 2.2  Age Group × Purchase Frequency ──────────────────────────────────────
+print("\n[2.2] Age Group × Purchase Frequency")
+
+age_stats = (
+    completed_sp
+    .filter(col("age_group") != "Unknown")
+    .groupBy("age_group")
+    .agg(
+        F.countDistinct("user_id").alias("unique_buyers"),
+        F.countDistinct("order_id").alias("total_orders"),
+        F.sum("sale_price").alias("total_revenue"),
+        F.mean("sale_price").alias("avg_item_price"),
+    )
+    .toPandas()
+    .set_index("age_group")
+    .reindex(AGE_LABELS)
+    .dropna(how="all")
+)
+age_stats["orders_per_buyer"]  = age_stats["total_orders"]  / age_stats["unique_buyers"]
+age_stats["revenue_per_buyer"] = age_stats["total_revenue"] / age_stats["unique_buyers"]
+
+palette_age = sns.color_palette("viridis", len(age_stats))
+fig, axes   = plt.subplots(2, 2, figsize=(18, 12))
+
+for ax, (metric, title, fmt) in zip(axes.flat, [
+    ("unique_buyers",    "Unique Buyers by Age Group",  lambda x, _: f"{x:,.0f}"),
+    ("orders_per_buyer", "Avg Orders per Buyer",        None),
+    ("revenue_per_buyer","Revenue per Buyer ($)",       lambda x, _: f"${x:,.0f}"),
+    ("avg_item_price",   "Avg Item Price ($)",          lambda x, _: f"${x:.0f}"),
+]):
+    age_stats[metric].plot(kind="bar", ax=ax, color=palette_age, rot=30)
+    ax.set_title(title)
+    if fmt:
+        ax.yaxis.set_major_formatter(mticker.FuncFormatter(fmt))
+
+axes[0, 1].axhline(age_stats["orders_per_buyer"].mean(), color="red",
+                   linestyle="--", linewidth=1.2, label="Overall avg")
+axes[0, 1].legend()
+save_fig("2_2_age_purchase_freq.png",
+         "Age Group × Purchase Behaviour: Volume, Frequency & Basket Size")
+
+print(age_stats[["unique_buyers", "orders_per_buyer",
+                  "revenue_per_buyer", "avg_item_price"]].round(2).to_string())
+
+
+# ── 2.3  Traffic Source → Conversion Rate ────────────────────────────────────
+print("\n[2.3] Traffic Source → Conversion Rate")
+
+traffic_conv = (
+    full_sp
+    .filter(col("traffic_source").isNotNull())
+    .groupBy("traffic_source")
+    .agg(
+        F.countDistinct("user_id").alias("total_users"),
+        F.countDistinct(when(col("is_complete") == 1, col("user_id"))).alias("converted_users"),
+        F.sum("sale_price").alias("total_revenue"),
+    )
+    .toPandas()
+    .set_index("traffic_source")
+)
+traffic_conv["conversion_rate"] = traffic_conv["converted_users"] / traffic_conv["total_users"] * 100
+traffic_conv["revenue_per_user"] = traffic_conv["total_revenue"] / traffic_conv["total_users"]
+traffic_conv = traffic_conv.sort_values("conversion_rate", ascending=False)
+
+fig, axes = plt.subplots(1, 2, figsize=(18, 7))
+palette_conv = ["#2ecc71" if v >= traffic_conv["conversion_rate"].median() else "#e74c3c"
+                for v in traffic_conv["conversion_rate"]]
+bars = axes[0].bar(traffic_conv.index, traffic_conv["conversion_rate"],
+                   color=palette_conv, width=0.55)
+axes[0].axhline(traffic_conv["conversion_rate"].median(), color="black",
+                linestyle="--", linewidth=1.2,
+                label=f"Median: {traffic_conv['conversion_rate'].median():.1f}%")
+axes[0].set_title("Conversion Rate by Traffic Source\n(Users → Completed Orders)")
+axes[0].set_ylabel("Conversion Rate (%)")
+axes[0].legend()
+axes[0].tick_params(axis="x", rotation=30)
+for bar, val in zip(bars, traffic_conv["conversion_rate"]):
+    axes[0].text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.3,
+                 f"{val:.1f}%", ha="center", va="bottom", fontsize=9)
+
+axes[1].scatter(
+    traffic_conv["conversion_rate"], traffic_conv["revenue_per_user"],
+    s=traffic_conv["total_users"] / traffic_conv["total_users"].max() * 800 + 100,
+    c=range(len(traffic_conv)), cmap="tab10",
+    alpha=0.85, edgecolors="white", linewidths=1.2, zorder=5,
+)
+for src, row in traffic_conv.iterrows():
+    axes[1].annotate(src, (row["conversion_rate"], row["revenue_per_user"]),
+                     textcoords="offset points", xytext=(8, 4), fontsize=9)
+axes[1].axvline(traffic_conv["conversion_rate"].mean(),  color="gray", linestyle="--", linewidth=1)
+axes[1].axhline(traffic_conv["revenue_per_user"].mean(), color="gray", linestyle="--", linewidth=1)
+axes[1].set_title("Conversion Rate vs Revenue/User\n(Ideal: top-right; bubble = volume)")
+axes[1].set_xlabel("Conversion Rate (%)")
+axes[1].set_ylabel("Revenue per User ($)")
+axes[1].yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"${x:,.0f}"))
+save_fig("2_3_traffic_conversion.png",
+         "Traffic Source: Conversion Rate & Revenue Quality")
+
+print(traffic_conv[["total_users", "converted_users",
+                     "conversion_rate", "revenue_per_user"]].round(2).to_string())
+
+
+# ── 2.4  Top Countries by Revenue ────────────────────────────────────────────
+print("\n[2.4] Top Countries by Revenue")
+
+country_rev = (
+    completed_sp
+    .filter(col("country").isNotNull())
+    .groupBy("country")
+    .agg(
+        F.sum("sale_price").alias("revenue"),
+        F.countDistinct("user_id").alias("buyers"),
+        F.mean("sale_price").alias("avg_item_price"),
+    )
+    .orderBy(col("revenue").desc())
+    .limit(20)
+    .toPandas()
+    .set_index("country")
+)
+country_rev["revenue_per_buyer"] = country_rev["revenue"] / country_rev["buyers"]
+
+fig, axes = plt.subplots(1, 2, figsize=(20, 9))
+axes[0].barh(country_rev.index, country_rev["revenue"],
+             color=sns.color_palette("Blues_r", len(country_rev)))
+axes[0].set_title("Top 20 Countries — Total Revenue")
+axes[0].set_xlabel("Revenue ($)")
+axes[0].xaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"${x/1e3:,.0f}K"))
+axes[0].invert_yaxis()
+axes[0].yaxis.set_tick_params(labelsize=9)
+
+rpb_sorted = country_rev.sort_values("revenue_per_buyer", ascending=False)
+axes[1].barh(rpb_sorted.index, rpb_sorted["revenue_per_buyer"],
+             color=sns.color_palette("Oranges_r", len(rpb_sorted)))
+axes[1].set_title("Top 20 Countries — Revenue per Buyer")
+axes[1].set_xlabel("Revenue / Buyer ($)")
+axes[1].xaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"${x:,.0f}"))
+axes[1].invert_yaxis()
+axes[1].yaxis.set_tick_params(labelsize=9)
+save_fig("2_4_country_revenue.png",
+         "Top Countries by Revenue: Total vs Per-Buyer Value")
+
+print(country_rev[["revenue", "buyers", "revenue_per_buyer",
+                    "avg_item_price"]].head(10).round(2).to_string())
+
+
+# ── 2.5  Top Countries by Return Rate ────────────────────────────────────────
+print("\n[2.5] Top Countries by Return Rate")
+
+country_return = (
+    full_sp
+    .filter(col("country").isNotNull())
+    .groupBy("country")
+    .agg(
+        F.count("status").alias("total_items"),
+        F.sum("is_returned").alias("returned_items"),
+    )
+    .filter(col("total_items") >= 100)
+    .toPandas()
+    .set_index("country")
+)
+country_return["return_rate"] = country_return["returned_items"] / country_return["total_items"] * 100
+
+top_return = country_return.sort_values("return_rate", ascending=False).head(20)
+merged     = top_return.join(country_rev[["revenue"]], how="left").sort_values("return_rate", ascending=False)
+
+fig, axes = plt.subplots(1, 2, figsize=(20, 9))
+palette_rr = ["#c0392b" if v >= country_return["return_rate"].median() else "#3498db"
+              for v in top_return["return_rate"]]
+axes[0].barh(top_return.index, top_return["return_rate"], color=palette_rr)
+axes[0].axvline(country_return["return_rate"].median(), color="black",
+                linestyle="--", linewidth=1.2,
+                label=f"Global median: {country_return['return_rate'].median():.1f}%")
+axes[0].set_title("Top 20 Countries — Return Rate (%)")
+axes[0].set_xlabel("Return Rate (%)")
+axes[0].legend()
+axes[0].invert_yaxis()
+axes[0].yaxis.set_tick_params(labelsize=9)
+
+scatter_data = merged.dropna(subset=["revenue"])
+axes[1].scatter(
+    scatter_data["revenue"], scatter_data["return_rate"],
+    s=(scatter_data["total_items"] / scatter_data["total_items"].max()) * 600 + 60,
+    c=range(len(scatter_data)), cmap="tab20",
+    alpha=0.85, edgecolors="white", linewidths=1, zorder=5,
+)
+for country, row in scatter_data.iterrows():
+    axes[1].annotate(country, (row["revenue"], row["return_rate"]),
+                     textcoords="offset points", xytext=(6, 3), fontsize=8)
+axes[1].axvline(scatter_data["revenue"].mean(),     color="gray", linestyle="--", linewidth=1)
+axes[1].axhline(scatter_data["return_rate"].mean(), color="gray", linestyle="--", linewidth=1)
+axes[1].set_title("Revenue vs Return Rate by Country\n(Top-left quadrant = high-risk market)")
+axes[1].set_xlabel("Total Revenue ($)")
+axes[1].set_ylabel("Return Rate (%)")
+axes[1].xaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"${x/1e3:,.0f}K"))
+save_fig("2_5_country_return_rate.png",
+         "Country Risk Map: High Revenue vs High Return Rate")
+
+print(top_return[["return_rate", "returned_items", "total_items"]].head(10).round(2).to_string())
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  PHẦN 5 — PHÂN TÍCH SẢN PHẨM (Đồ hoạ đơn + đa biến)
 # ═════════════════════════════════════════════════════════════════════════════
 print("=" * 60)
-print("SECTION 5: PRODUCT ANALYSIS")
+print("PHẦN 5: PHÂN TÍCH SẢN PHẨM")
 print("=" * 60)
 
 
@@ -147,7 +679,7 @@ print("=" * 60)
 print("\n[5.1] Revenue vs Quantity by Category")
 
 cat_rev = (
-    completed_sp
+    completed_sp_prod
     .groupBy("category")
     .agg(
         F.sum("sale_price").alias("revenue"),
@@ -192,7 +724,7 @@ print(cat_rev[["revenue", "quantity", "rev_rank", "qty_rank", "rank_diff"]]
 print("\n[5.2] Profit Margin by Category")
 
 cat_margin = (
-    completed_sp
+    completed_sp_prod
     .groupBy("category")
     .agg(
         F.mean("margin_pct").alias("avg_margin"),
@@ -239,7 +771,7 @@ print(cat_margin[["avg_margin", "total_profit", "avg_sale_price", "avg_cost"]].h
 print("\n[5.3] Return Rate by Category")
 
 cat_return = (
-    full_sp
+    full_sp_prod
     .groupBy("category")
     .agg(
         F.count("status").alias("total_items"),
@@ -363,7 +895,7 @@ print(double_risk[["avg_margin", "return_rate", "total_items"]].round(2))
 print("\n[5.5] Category × Gender")
 
 cat_gender_sp = (
-    completed_sp
+    completed_sp_prod
     .filter(col("gender").isin("M", "F"))
     .groupBy("category", "gender")
     .agg(F.sum("sale_price").alias("revenue"))
@@ -405,10 +937,10 @@ print(cat_gender_pct.round(1))
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  SECTION 6 — CHANNEL & BEHAVIOR ANALYSIS
+#  PHẦN 6 — PHÂN TÍCH KÊNH & HÀNH VI (Đồ hoạ đa biến)
 # ═════════════════════════════════════════════════════════════════════════════
 print("\n" + "=" * 60)
-print("SECTION 6: CHANNEL & BEHAVIOR ANALYSIS")
+print("PHẦN 6: PHÂN TÍCH KÊNH & HÀNH VI")
 print("=" * 60)
 
 
@@ -416,7 +948,7 @@ print("=" * 60)
 print("\n[6.1] Traffic Source × AOV")
 
 traffic_aov = (
-    completed_sp
+    completed_sp_prod
     .groupBy("traffic_source")
     .agg(
         F.sum("sale_price").alias("total_revenue"),
@@ -466,7 +998,7 @@ print(traffic_aov[["AOV", "revenue_per_user", "total_users", "total_revenue"]].r
 print("\n[6.2] Traffic Source × Return Rate")
 
 traffic_return = (
-    full_sp
+    full_sp_prod
     .filter(col("traffic_source").isNotNull())
     .groupBy("traffic_source")
     .agg(
@@ -515,7 +1047,7 @@ print(traffic_return[["return_rate", "returned", "total_items"]].round(2))
 # ── 6.3  Delivery Time Analysis ──────────────────────────────────────────────
 print("\n[6.3] Delivery Time Analysis")
 
-delivered_sp = full_sp.filter(
+delivered_sp = full_sp_prod.filter(
     col("delivery_days").isNotNull() &
     (col("delivery_days") > 0) &
     (col("delivery_days") < 60)
@@ -602,7 +1134,7 @@ print(country_stats)
 print("\n[6.4] Delivery Time × Return Rate Correlation by Country")
 
 country_return_sp = (
-    full_sp
+    full_sp_prod
     .filter(col("country").isin(top_countries))
     .groupBy("country")
     .agg(
@@ -684,9 +1216,20 @@ else:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-print("\n" + "=" * 60)
+print(f"\n{DIVIDER}")
 print("EDA COMPLETE — Charts saved:")
 for f in [
+    "1_1_monthly_revenue.png",
+    "1_2_monthly_orders_aov.png",
+    "1_3_order_status.png",
+    "1_4_sale_price_dist.png",
+    "1_5_user_age_dist.png",
+    "2_1_gender_revenue.png",
+    "2_2_age_purchase_freq.png",
+    "2_3_traffic_conversion.png",
+    "2_4_country_revenue.png",
+    "2_5_country_return_rate.png",
+
     "5_1_revenue_vs_quantity.png",
     "5_2_profit_margin.png",
     "5_3_return_rate.png",
@@ -698,4 +1241,4 @@ for f in [
     "6_4_delivery_return_corr.png",
 ]:
     print(f"  {f}")
-print("=" * 60)
+print(DIVIDER)

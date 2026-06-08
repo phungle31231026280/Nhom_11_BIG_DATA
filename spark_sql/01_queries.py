@@ -4,6 +4,8 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import seaborn as sns
 import os
+from dotenv import load_dotenv
+load_dotenv()
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
@@ -52,12 +54,17 @@ spark = (
 )
 spark.sparkContext.setLogLevel("WARN")
 
-HDFS_BASE = "hdfs://localhost:9000/data/datatest"
+# Lấy từng mảnh ghép từ .env và ghép lại thành URL hoàn chỉnh
+HDFS_HOST     = os.getenv("HDFS_HOST", "localhost")
+HDFS_PORT     = os.getenv("HDFS_PORT", "9000")
+HDFS_BASE_DIR = os.getenv("HDFS_BASE_DIR", "/data/datatest")
+
+# Bắt buộc phải nối thành chuỗi có chữ hdfs://
+HDFS_BASE = f"hdfs://{HDFS_HOST}:{HDFS_PORT}{HDFS_BASE_DIR}"
 
 def load(filename):
-    # Sửa lại để nhận trực tiếp tên file đầy đủ có đuôi .csv
     path = f"{HDFS_BASE}/{filename}"
-    print(f"  Loading {filename} ...")
+    print(f"  Loading {path} ...")  # In ra toàn bộ đường dẫn để dễ debug
     return (
         spark.read
         .option("header",      "true")
@@ -66,7 +73,6 @@ def load(filename):
         .option("escape",      '"')
         .csv(path)
     )
-
 print("Loading data from HDFS...")
 orders_sp       = load("thelook_ecommerce.orders.csv")
 
